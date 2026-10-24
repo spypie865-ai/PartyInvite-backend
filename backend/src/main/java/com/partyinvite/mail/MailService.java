@@ -1,21 +1,25 @@
 package com.partyinvite.mail;
 
 import com.partyinvite.invite.Invite;
-import jakarta.mail.internet.MimeMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.mail.javamail.JavaMailSender;
-import org.springframework.mail.javamail.MimeMessageHelper;
+import org.springframework.http.MediaType;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestClient;
+import org.springframework.web.client.RestClientResponseException;
 import org.springframework.web.util.HtmlUtils;
 
 import java.text.NumberFormat;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 @Service
 public class MailService {
@@ -24,10 +28,19 @@ public class MailService {
     private static final DateTimeFormatter WHEN =
             DateTimeFormatter.ofPattern("EEE, d MMM yyyy 'at' h:mm a", Locale.ENGLISH);
 
-    private final JavaMailSender sender;
-    @Value("${app.frontend-url}") private String frontendUrl;
+    private final RestClient http;
 
-    public MailService(JavaMailSender sender) { this.sender = sender; }
+    @Value("${app.frontend-url}") private String frontendUrl;
+    @Value("${brevo.api-key:}") private String apiKey;
+    @Value("${mail.from:}") private String from;
+    @Value("${mail.from-name:PartyInvite}") private String fromName;
+
+    public MailService() {
+        SimpleClientHttpRequestFactory f = new SimpleClientHttpRequestFactory();
+        f.setConnectTimeout(Duration.ofSeconds(5));
+        f.setReadTimeout(Duration.ofSeconds(10));
+        this.http = RestClient.builder().requestFactory(f).build();
+    }
 
     // ───────────────────────── Public API ─────────────────────────
 
@@ -126,18 +139,31 @@ public class MailService {
              layout("Payment confirmed. You're officially in.", "🧾", "Your receipt", guestBody, null, null));
     }
 
-    // ───────────────────────── Sending ─────────────────────────
+    // ───────────────────────── Sending (Brevo HTTP API) ─────────────────────────
 
     private void send(String to, String subject, String text, String html) {
         if (to == null || to.isBlank()) return;
+        if (apiKey.isBlank() || from.isBlank()) {
+            log.warn("Email not configured (BREVO_API_KEY / MAIL_FROM missing); skipping mail to {}", to);
+            return;
+        }
         try {
-            MimeMessage m = sender.createMimeMessage();
-            MimeMessageHelper h = new MimeMessageHelper(m, true, "UTF-8");
-            h.setTo(to);
-            h.setSubject(subject);
-            h.setText(text, html); // plain-text + HTML alternative
-            sender.send(m);
-            log.info("sended mail to "+to);
+            http.post()
+                .uri("https://api.brevo.com/v3/smtp/email")
+                .header("api-key", apiKey)
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of(
+                    "sender", Map.of("name", fromName, "email", from),
+                    "to", List.of(Map.of("email", to)),
+                    "subject", subject,
+                    "htmlContent", html,
+                    "textContent", text))
+                .retrieve()
+                .toBodilessEntity();
+            log.info("Mail sent to {}", to);
+        } catch (RestClientResponseException ex) {
+            // Brevo's error body says exactly what's wrong (bad key, unverified sender, etc.)
+            log.warn("Email delivery failed for {}: {} {}", to, ex.getStatusCode(), ex.getResponseBodyAsString());
         } catch (Exception ex) {
             // Email is best-effort: never roll back a valid invite/acceptance/payment.
             log.warn("Email delivery failed for {}: {}", to, ex.getMessage());
